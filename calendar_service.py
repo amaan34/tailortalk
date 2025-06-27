@@ -7,10 +7,25 @@ from typing import List, Dict, Optional
 import os
 import asyncio
 import logging
+import json
 
 # Set up a logger for this service
 logger = logging.getLogger(__name__)
 
+def setup_credentials_from_env():
+    """Writes Google credentials from env vars to files for the API client to use."""
+    creds_json_str = os.getenv("GOOGLE_CREDS_JSON")
+    token_json_str = os.getenv("GOOGLE_TOKEN_JSON")
+
+    if creds_json_str:
+        with open("credentials.json", "w") as f:
+            f.write(creds_json_str)
+        logger.info("Created credentials.json from environment variable.")
+
+    if token_json_str:
+        with open("token.json", "w") as f:
+            f.write(token_json_str)
+        logger.info("Created token.json from environment variable.")
 class CalendarService:
     """
     A service class to handle all interactions with the Google Calendar API.
@@ -18,6 +33,8 @@ class CalendarService:
     """
     
     def __init__(self, scopes: List[str] = ['https://www.googleapis.com/auth/calendar']):
+        setup_credentials_from_env()
+        
         self.service: Optional[Resource] = None
         self.credentials: Optional[Credentials] = None
         self.scopes = scopes

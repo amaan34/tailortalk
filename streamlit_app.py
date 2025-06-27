@@ -21,7 +21,11 @@ def initialize_session_state():
     if 'messages' not in st.session_state:
         st.session_state.messages = []
     if 'api_base_url' not in st.session_state:
-        st.session_state.api_base_url = "http://127.0.0.1:8000"
+        try:
+            st.session_state.api_base_url = st.secrets["API_BASE_URL"]
+        except FileNotFoundError:
+            # Fallback for local development
+            st.session_state.api_base_url = "http://127.0.0.1:8000"
     if 'pending_action' not in st.session_state:
         st.session_state.pending_action = None
     if 'upcoming_events' not in st.session_state:
