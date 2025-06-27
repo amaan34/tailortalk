@@ -29,59 +29,20 @@ def setup_credentials_from_env():
 class CalendarService:
     """
     A service class to handle all interactions with the Google Calendar API.
-    This class is now fully async and uses asyncio.to_thread for blocking calls.
+    This class is now instantiated with a specific user's credentials.
     """
-    
-    def __init__(self, scopes: List[str] = ['https://www.googleapis.com/auth/calendar']):
-        setup_credentials_from_env()
-        
-        self.service: Optional[Resource] = None
-        self.credentials: Optional[Credentials] = None
-        self.scopes = scopes
-        self.token_file = 'token.json'
-        self.creds_file = 'credentials.json'
-
-    async def _authenticate(self):
+    def __init__(self, user_credentials: dict):
         """
-        Asynchronously authenticates with the Google Calendar API.
-        Handles token loading, refreshing, and new user authorization.
+        Initializes the service with a user's token dictionary.
         """
-        logger.info("Attempting to authenticate with Google Calendar API.")
-        creds = None
-        if os.path.exists(self.token_file):
-            try:
-                creds = Credentials.from_authorized_user_file(self.token_file, self.scopes)
-                logger.info("Loaded credentials from token.json.")
-            except Exception as e:
-                logger.error(f"Failed to load credentials from token.json: {e}")
-
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                logger.info("Credentials have expired. Refreshing token...")
-                try:
-                    creds.refresh(Request())
-                    logger.info("Token refreshed successfully.")
-                except Exception as e:
-                    logger.error(f"Failed to refresh token: {e}. Re-authentication will be required.")
-                    creds = None # Force re-authentication
-            else:
-                logger.info("No valid credentials found. Starting local server for new authorization.")
-                if not os.path.exists(self.creds_file):
-                    logger.critical(f"FATAL: credentials.json not found. Cannot authenticate.")
-                    raise FileNotFoundError(f"Missing required credentials file: {self.creds_file}")
-                
-                flow = InstalledAppFlow.from_client_secrets_file(self.creds_file, self.scopes)
-                # Running the local server in a separate thread to avoid blocking asyncio event loop
-                creds = await asyncio.to_thread(flow.run_local_server, port=0)
-            
-            # Save the new or refreshed credentials
-            with open(self.token_file, 'w') as token:
-                token.write(creds.to_json())
-            logger.info(f"Credentials saved to {self.token_file}.")
-            
-        self.credentials = creds
-        self.service = build('calendar', 'v3', credentials=self.credentials)
-        logger.info("Google Calendar service built successfully.")
+        try:
+            # Create credentials directly from the user's token dictionary
+            self.credentials = Credentials.from_authorized_user_info(user_credentials, scopes=['https://www.googleapis.com/auth/calendar'])
+            self.service = build('calendar', 'v3', credentials=self.credentials)
+            logger.info("CalendarService instantiated for a user.")
+        except Exception as e:
+            logger.error(f"Failed to create calendar service with user credentials: {e}")
+            raise
 
     async def _get_service(self) -> Resource:
         """Ensures the service is authenticated and returns the service object."""

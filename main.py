@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import os
@@ -7,9 +7,25 @@ import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import pytz
+import uuid
+from fastapi.responses import RedirectResponse
+from sqlalchemy.orm import Session
+from google_auth_oauthlib.flow import Flow
+from database import init_db, get_db, UserToken
+from security import encrypt_token, decrypt_token
+from calendar_service import CalendarService
 
 from agent import TailorTalkAgent
 from models import ChatMessage
+
+# Initialize the database on startup
+init_db()
+
+# --- Google OAuth2 Flow Setup ---
+# This uses the credentials.json file content from your environment variable
+CLIENT_CONFIG = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
+SCOPES = ['https://www.googleapis.com/auth/calendar']
+
 
 # --- Logging Configuration ---
 # Configure logging to output to console with a specific format and level
@@ -25,6 +41,7 @@ load_dotenv()
 if not os.getenv("OPENAI_API_KEY"):
     logger.critical("FATAL: OPENAI_API_KEY environment variable is not set.")
     raise RuntimeError("Missing OPENAI_API_KEY. Please set it in your environment or a .env file.")
+
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
@@ -64,10 +81,80 @@ except Exception as e:
 # --- Timezone Configuration ---
 LOCAL_TIMEZONE = pytz.timezone("Asia/Kolkata")
 
+
+# --- New Endpoints for Authentication ---
+
+@app.get("/login")
+def login(request: Request):
+    """Initiates the Google OAuth2 login flow."""
+    flow = Flow.from_client_config(
+        client_config=CLIENT_CONFIG,
+        scopes=SCOPES,
+        redirect_uri=f"{request.base_url}callback"
+    )
+    authorization_url, state = flow.authorization_url(
+        access_type='offline',
+        prompt='consent'
+    )
+    # Store the state in the user's session to prevent CSRF
+    request.session['state'] = state
+    return RedirectResponse(authorization_url)
+
+@app.get("/callback")
+def callback(request: Request, db: Session = Depends(get_db)):
+    """Handles the redirect from Google after user authentication."""
+    state = request.session['state']
+    flow = Flow.from_client_config(
+        client_config=CLIENT_CONFIG,
+        scopes=SCOPES,
+        state=state,
+        redirect_uri=f"{request.base_url}callback"
+    )
+    flow.fetch_token(authorization_response=str(request.url))
+
+    # Get user's credentials
+    credentials = flow.credentials
+    token = {
+        'token': credentials.token,
+        'refresh_token': credentials.refresh_token,
+        'token_uri': credentials.token_uri,
+        'client_id': credentials.client_id,
+        'client_secret': credentials.client_secret,
+        'scopes': credentials.scopes
+    }
+
+    # Encrypt and save the token to the database
+    encrypted_token = encrypt_token(token)
+    session_id = str(uuid.uuid4())
+    db_token = UserToken(session_id=session_id, encrypted_token=encrypted_token)
+    db.add(db_token)
+    db.commit()
+
+    # Redirect user back to the Streamlit app with their new session ID
+    streamlit_app_url = os.getenv("STREAMLIT_APP_URL", "http://localhost:8501")
+    return RedirectResponse(f"{streamlit_app_url}?session_id={session_id}")
+
+
+# --- Dependency for getting the Calendar Service ---
+
+async def get_calendar_service(x_session_id: str = Header(), db: Session = Depends(get_db)) -> CalendarService:
+    """Dependency to get a user-specific CalendarService instance."""
+    if not x_session_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session ID missing")
+    
+    db_token = db.query(UserToken).filter(UserToken.session_id == x_session_id).first()
+    if not db_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session ID")
+        
+    user_creds = decrypt_token(db_token.encrypted_token)
+    return CalendarService(user_credentials=user_creds)
+
+
 # --- API Endpoints ---
 
 @app.post("/chat", response_model=ChatMessage)
-async def chat(message: ChatMessage):
+async def chat(message: ChatMessage,
+               calendar_service: CalendarService = Depends(get_calendar_service)):
     """
     This is the primary endpoint for interacting with the agent.
     It processes a chat message and returns the agent's response.
@@ -77,7 +164,8 @@ async def chat(message: ChatMessage):
         response_data = await agent.process_message(
             message.content,
             message.session_id,
-            message.context
+            message.context,
+            calendar_service
         )
         return ChatMessage(
             content=response_data["message"],
@@ -104,7 +192,8 @@ async def health_check():
 @app.get("/events", summary="Get Upcoming Calendar Events")
 async def get_events(
     start_date: str = Query(None, description="Start date in ISO format"),
-    end_date: str = Query(None, description="End date in ISO format")
+    end_date: str = Query(None, description="End date in ISO format"),
+    calendar_service: CalendarService = Depends(get_calendar_service)
 ):
     """
     Fetches upcoming events from the user's primary calendar.

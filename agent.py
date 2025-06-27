@@ -36,7 +36,6 @@ class TailorTalkAgent:
 
     def __init__(self):
         self.llm = ChatOpenAI(temperature=0.1, model="gpt-3.5-turbo")
-        self.calendar_service = CalendarService()
         self.sessions: Dict[str, AgentState] = {}
         self.initial_state = AgentState(
             session_id="",
@@ -158,7 +157,8 @@ class TailorTalkAgent:
         state['messages'].append(AIMessage(content=response_message))
         return state
         
-    async def _complete_reschedule(self, state: AgentState) -> AgentState:
+    async def _complete_reschedule(self, state: AgentState, config: dict) -> AgentState:
+        calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """Handles the SECOND step of rescheduling: processing the user's new desired time."""
         logger.debug(f"[{state['session_id']}] Node: _complete_reschedule")
         
@@ -248,7 +248,8 @@ class TailorTalkAgent:
         state['messages'].append(AIMessage(content=message))
         return state
 
-    async def _handle_cancellation(self, state: AgentState) -> AgentState:
+    async def _handle_cancellation(self, state: AgentState, config: dict) -> AgentState:
+        calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """Deletes the confirmed event."""
         logger.debug(f"[{state['session_id']}] Node: _handle_cancellation")
         event_to_cancel = state['cancellation_candidates'][0]
@@ -311,7 +312,8 @@ class TailorTalkAgent:
             return "reschedule"
         return "not_found"
 
-    async def _find_event_for_action(self, state: AgentState) -> AgentState:
+    async def _find_event_for_action(self, state: AgentState, config: dict) -> AgentState:
+        calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """Finds calendar events based on the user's message, now with whole-day search."""
         logger.debug(f"[{state['session_id']}] Node: _find_event_for_action")
         
@@ -382,32 +384,25 @@ class TailorTalkAgent:
             state['context']['user_informed_slot_is_busy'] = True
             return "suggest_alternatives"
         
-    async def process_message(self, message: str, session_id: str, context: Dict = None) -> Dict[str, Any]:
-        """Processes an incoming message through the agent's graph."""
+    async def process_message(self, message: str, session_id: str, context: Dict, calendar_service: CalendarService) -> Dict[str, Any]:
         logger.info(f"Processing message for session_id: {session_id}")
         if session_id not in self.sessions:
-            logger.info(f"New session created: {session_id}")
             self.sessions[session_id] = self.initial_state.copy()
             self.sessions[session_id]['session_id'] = session_id
         
         state = self.sessions[session_id]
-        
-        state['context'].pop('availability', None)
-        state['context'].pop('availability_error', None)
-
         state['messages'].append(HumanMessage(content=message))
         if context:
             state['context'].update(context)
 
-        result_state = await self.graph.ainvoke(state)
+        graph_config = {"configurable": {"calendar_service": calendar_service}}
+        result_state = await self.graph.ainvoke(state, config=graph_config)
         
         self.sessions[session_id] = result_state
-
-        logger.info(f"Finished processing for session_id: {session_id}. Final intent: '{result_state['intent']}'")
+        logger.info(f"Finished processing. Final intent: '{result_state['intent']}'")
         return {
             "message": result_state['messages'][-1].content if result_state['messages'] else "How can I help you?",
-            "context": result_state['context'],
-            "intent": result_state['intent']
+            "context": result_state['context'], "intent": result_state['intent']
         }
 
     async def _understand_intent(self, state: AgentState) -> AgentState:
@@ -462,7 +457,8 @@ class TailorTalkAgent:
 
     # ... (_route_after_datetime_extraction is the same) ...
 
-    async def _check_availability(self, state: AgentState) -> AgentState:
+    async def _check_availability(self, state: AgentState, config: dict) -> AgentState:
+        calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """Node to check the calendar for available slots."""
         logger.debug(f"[{state['session_id']}] Node: _check_availability")
         
@@ -597,7 +593,8 @@ class TailorTalkAgent:
         state['messages'].append(AIMessage(content=response))
         return state
 
-    async def _confirm_booking(self, state: AgentState) -> AgentState:
+    async def _confirm_booking(self, state: AgentState, config: dict) -> AgentState:
+        calendar_service: CalendarService = config["configurable"]["calendar_service"]
         logger.debug(f"[{state['session_id']}] Node: _confirm_booking")
         booking_time_str = state['extracted_info'].get("parsed_datetime")
         if not booking_time_str:
@@ -627,7 +624,8 @@ class TailorTalkAgent:
     
         # --- Graph Nodes ---
     
-    async def _check_specific_slot(self, state: AgentState) -> AgentState:
+    async def _check_specific_slot(self, state: AgentState, config: dict) -> AgentState:
+        calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """New node to check availability for only the exact time the user requested."""
         logger.debug(f"[{state['session_id']}] Node: _check_specific_slot")
         try:
