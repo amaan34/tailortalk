@@ -107,10 +107,8 @@ class CalendarService:
             event_details = {
                 'summary': title,
                 'description': description,
-                # [MODIFICATION] Remove the explicit 'timeZone' key.
-                # The timezone info is now included in the start_time and end_time ISO strings.
-                'start': {'dateTime': start_time},
-                'end': {'dateTime': end_time},
+                'start': {'dateTime': start_time, 'timeZone': 'Asia/Kolkata'},
+                'end': {'dateTime': end_time, 'timeZone': 'Asia/Kolkata'},
             }
             if attendees:
                 event_details['attendees'] = [{'email': email} for email in attendees]
@@ -125,3 +123,65 @@ class CalendarService:
         except Exception as e:
             logger.error(f"An error occurred while creating the event: {e}", exc_info=True)
             return {"error": f"Failed to create event in Calendar API: {e}"}
+
+    async def search_events(self, start_time: str, end_time: str, query: Optional[str] = None) -> Dict:
+        """Asynchronously searches for events within a given time range."""
+        logger.info(f"Searching for events from {start_time} to {end_time} with query: '{query}'")
+        try:
+            service = await self._get_service()
+            
+            # [MODIFICATION] Build params dict conditionally to avoid sending `q=None`
+            params = {
+                'calendarId': 'primary',
+                'timeMin': start_time,
+                'timeMax': end_time,
+                'singleEvents': True,
+                'orderBy': 'startTime'
+            }
+            if query:
+                params['q'] = query
+
+            def _blocking_call():
+                return service.events().list(**params).execute()
+
+            events_result = await asyncio.to_thread(_blocking_call)
+            logger.info(f"Found {len(events_result.get('items', []))} events.")
+            return events_result
+        except Exception as e:
+            logger.error(f"An error occurred while searching events: {e}", exc_info=True)
+            return {"error": f"Failed to search for events in Calendar API: {e}"}
+
+    async def delete_event(self, event_id: str) -> Dict:
+        """Asynchronously deletes a calendar event by its ID."""
+        logger.info(f"Attempting to delete event with ID: {event_id}")
+        try:
+            service = await self._get_service()
+
+            def _blocking_call():
+                service.events().delete(calendarId='primary', eventId=event_id).execute()
+                return {"success": True, "event_id": event_id}
+
+            result = await asyncio.to_thread(_blocking_call)
+            logger.info(f"Successfully deleted event with ID: {event_id}")
+            return result
+        except Exception as e:
+            logger.error(f"An error occurred while deleting the event: {e}", exc_info=True)
+            return {"error": f"Failed to delete event in Calendar API: {e}"}
+            
+    async def update_event(self, event_id: str, body: Dict) -> Dict:
+        """Asynchronously updates an existing calendar event."""
+        logger.info(f"Attempting to update event with ID: {event_id}")
+        try:
+            service = await self._get_service()
+
+            def _blocking_call():
+                return service.events().update(
+                    calendarId='primary', eventId=event_id, body=body
+                ).execute()
+            
+            updated_event = await asyncio.to_thread(_blocking_call)
+            logger.info(f"Successfully updated event with ID: {event_id}")
+            return updated_event
+        except Exception as e:
+            logger.error(f"An error occurred while updating the event: {e}", exc_info=True)
+            return {"error": f"Failed to update event in Calendar API: {e}"}

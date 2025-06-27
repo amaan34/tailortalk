@@ -1,7 +1,7 @@
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
-from typing import Dict, List, Any, TypedDict
+from typing import Dict, List, Any, TypedDict, Optional
 from datetime import datetime, timedelta
 import json
 import re
@@ -28,7 +28,9 @@ class AgentState(TypedDict):
     booking_confirmed: bool
     final_booking_details: BookingRequest
     conversation_stage: str
-
+    cancellation_candidates: List[Dict]
+    event_to_reschedule: Optional[Dict]
+    suggested_slots: List[Dict]
 class TailorTalkAgent:
     """The core conversational agent for booking appointments."""
 
@@ -40,7 +42,9 @@ class TailorTalkAgent:
             session_id="",
             messages=[], context={}, intent="", extracted_info={},
             availability_checked=False, booking_confirmed=False,
-            final_booking_details=None, conversation_stage="start"
+            final_booking_details=None, conversation_stage="start",
+            cancellation_candidates=[], event_to_reschedule=None,
+            suggested_slots=[]
         )
         self.graph = self._build_graph()
         logger.info("TailorTalkAgent initialized with a new graph.")
@@ -49,19 +53,51 @@ class TailorTalkAgent:
         """Builds the LangGraph conversation flow with more intelligent routing."""
         graph = StateGraph(AgentState)
 
+        graph.set_entry_point("initial_router")
+
+        # Add nodes
+        graph.add_node("initial_router", self._initial_router)
         graph.add_node("understand_intent", self._understand_intent)
         graph.add_node("extract_datetime", self._extract_datetime)
-        # [MODIFICATION] New node to check a single, specific slot
         graph.add_node("check_specific_slot", self._check_specific_slot)
         graph.add_node("check_availability", self._check_availability)
         graph.add_node("suggest_times", self._suggest_times)
         graph.add_node("confirm_booking", self._confirm_booking)
         graph.add_node("clarify_details", self._clarify_details)
+        graph.add_node("find_event_for_action", self._find_event_for_action)
+        graph.add_node("handle_cancellation", self._handle_cancellation)
+        graph.add_node("clarify_cancellation", self._clarify_cancellation)
+        graph.add_node("handle_reschedule_request", self._handle_reschedule_request)
+        graph.add_node("complete_reschedule", self._complete_reschedule)
+        graph.add_node("list_found_events", self._list_found_events)
+        graph.add_node("handle_general_inquiry", self._handle_general_inquiry)
 
-        graph.set_entry_point("understand_intent")
-        graph.add_edge("understand_intent", "extract_datetime")
-        
-        # This first router decides whether to check a specific slot or general availability
+        # Define graph edges
+        graph.add_conditional_edges(
+            "initial_router",
+            lambda state: "complete_reschedule" if state.get('event_to_reschedule') else "understand_intent",
+            {
+                "complete_reschedule": "complete_reschedule",
+                "understand_intent": "understand_intent"
+            }
+        )
+
+        graph.add_edge("complete_reschedule", END)
+
+        graph.add_conditional_edges(
+            "understand_intent",
+            self._route_by_intent,
+            {
+                "find_event": "find_event_for_action",
+                "book": "extract_datetime",
+                "check": "extract_datetime",
+                "cancel": "find_event_for_action",
+                "reschedule": "find_event_for_action",
+                "general_inquiry": "handle_general_inquiry",
+                "clarify": "clarify_details"
+            }
+        )
+
         graph.add_conditional_edges(
             "extract_datetime",
             self._route_after_datetime_extraction,
@@ -72,22 +108,267 @@ class TailorTalkAgent:
             }
         )
 
-        # [MODIFICATION] This new router decides what to do after checking a specific slot
         graph.add_conditional_edges(
             "check_specific_slot",
             self._route_after_specific_slot_check,
             {
                 "confirm": "confirm_booking",
-                "suggest_alternatives": "check_availability" # If busy, find other times
+                "suggest_alternatives": "check_availability"
             }
         )
 
+        graph.add_conditional_edges(
+            "find_event_for_action",
+            self._route_after_event_search,
+            {
+                "list_events": "list_found_events",
+                "cancel": "handle_cancellation",
+                "reschedule": "handle_reschedule_request",
+                "clarify_cancel": "clarify_cancellation",
+                "not_found": "list_found_events"
+            }
+        )
+
+        graph.add_edge("list_found_events", END)
         graph.add_edge("check_availability", "suggest_times")
         graph.add_edge("suggest_times", END)
         graph.add_edge("clarify_details", END)
+        graph.add_edge("clarify_cancellation", END)
+        graph.add_edge("handle_cancellation", END)
+        graph.add_edge("handle_reschedule_request", END)
         graph.add_edge("confirm_booking", END)
+        graph.add_edge("handle_general_inquiry", END)
+
 
         return graph.compile()
+
+    async def _initial_router(self, state: AgentState) -> AgentState:
+        """Acts as a gatekeeper to route to special handlers if a multi-turn process is active."""
+        logger.debug(f"[{state['session_id']}] Node: _initial_router. Checking for ongoing reschedule.")
+        return state
+
+    async def _handle_reschedule_request(self, state: AgentState) -> AgentState:
+        """Handles the FIRST step of a reschedule request: identifying the event and asking for the new time."""
+        logger.debug(f"[{state['session_id']}] Node: _handle_reschedule_request")
+        
+        event_to_reschedule = state['cancellation_candidates'][0]
+        state['event_to_reschedule'] = event_to_reschedule
+        
+        response_message = f"I can help with that. I've found the event '{event_to_reschedule.get('summary')}'. When were you thinking of rescheduling the appointment?"
+        state['messages'].append(AIMessage(content=response_message))
+        return state
+        
+    async def _complete_reschedule(self, state: AgentState) -> AgentState:
+        """Handles the SECOND step of rescheduling: processing the user's new desired time."""
+        logger.debug(f"[{state['session_id']}] Node: _complete_reschedule")
+        
+        original_event = state['event_to_reschedule']
+        latest_message = state['messages'][-1].content
+        
+        await self._extract_datetime(state)
+        new_time_str = state['extracted_info'].get("parsed_datetime")
+
+        if not new_time_str:
+            response_message = "I'm sorry, I didn't understand that time. Could you please provide the new date and time for the reschedule?"
+            state['messages'].append(AIMessage(content=response_message))
+            return state
+
+        new_start_time = parser.parse(new_time_str)
+        
+        # Calculate event duration from original event, default to 30 mins if not available
+        try:
+            original_start = parser.parse(original_event['start']['dateTime'])
+            original_end = parser.parse(original_event['end']['dateTime'])
+            duration = original_end - original_start
+        except (KeyError, TypeError):
+            duration = timedelta(minutes=30)
+        
+        new_end_time = new_start_time + duration
+        
+        availability_response = await self.calendar_service.get_availability(
+            new_start_time.isoformat(), new_end_time.isoformat()
+        )
+        busy_times = availability_response.get('calendars', {}).get('primary', {}).get('busy', [])
+
+        if busy_times:
+            response_message = f"I'm sorry, but that time is already booked. Please suggest another time for rescheduling '{original_event.get('summary')}'."
+            state['messages'].append(AIMessage(content=response_message))
+            return state
+
+        event_id = original_event['id']
+        update_body = {
+            'summary': original_event.get('summary'),
+            'description': original_event.get('description'),
+            'start': {'dateTime': new_start_time.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
+            'end': {'dateTime': new_end_time.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
+            'attendees': original_event.get('attendees', [])
+        }
+        
+        update_response = await self.calendar_service.update_event(event_id, update_body)
+
+        if "error" in update_response:
+            response_message = f"I'm sorry, an error occurred while trying to update the event: {update_response['error']}"
+        else:
+            formatted_time = new_start_time.strftime('%I:%M %p on %A, %B %d')
+            response_message = f"Excellent! I have successfully rescheduled your appointment to {formatted_time}."
+            state['event_to_reschedule'] = None
+            state['cancellation_candidates'] = []
+
+        state['messages'].append(AIMessage(content=response_message))
+        return state
+
+    async def _handle_reschedule(self, state: AgentState) -> AgentState:
+        """Handles the logic for rescheduling an event."""
+        logger.debug(f"[{state['session_id']}] Node: _handle_reschedule")
+        # This is a simplified version. A full implementation would be a sub-graph:
+        # 1. Confirm the event to reschedule (done by the router before this node).
+        # 2. Extract the NEW desired time from the user's message.
+        # 3. Check availability for the new time.
+        # 4. If free, call update_event. If not, suggest alternatives.
+        
+        event_to_reschedule = state['cancellation_candidates'][0]
+        state['event_to_reschedule'] = event_to_reschedule
+        
+        # For now, we just ask for the new time.
+        response_message = f"Okay, I'm ready to reschedule '{event_to_reschedule.get('summary')}'. What's the new time you'd like?"
+        state['messages'].append(AIMessage(content=response_message))
+        # The next turn of conversation would be handled by the graph again.
+        return state
+    
+    async def _clarify_cancellation(self, state: AgentState) -> AgentState:
+        """Asks the user to clarify which event to cancel from a list."""
+        logger.debug(f"[{state['session_id']}] Node: _clarify_cancellation")
+        candidates = state['cancellation_candidates']
+        options = []
+        for event in candidates:
+            start_time = parser.parse(event['start'].get('dateTime')).strftime('%I:%M %p')
+            options.append(f"'{event['summary']}' at {start_time}")
+        
+        message = "I found a few events that match. Which one did you mean?\n- " + "\n- ".join(options)
+        state['messages'].append(AIMessage(content=message))
+        return state
+
+    async def _handle_cancellation(self, state: AgentState) -> AgentState:
+        """Deletes the confirmed event."""
+        logger.debug(f"[{state['session_id']}] Node: _handle_cancellation")
+        event_to_cancel = state['cancellation_candidates'][0]
+        event_id = event_to_cancel.get('id')
+        summary = event_to_cancel.get('summary', 'your appointment')
+
+        result = await self.calendar_service.delete_event(event_id)
+
+        if "error" in result:
+            response_message = f"I'm sorry, I failed to cancel '{summary}'. Error: {result['error']}"
+        else:
+            response_message = f"Done. I have successfully cancelled your event: '{summary}'."
+        
+        state['messages'].append(AIMessage(content=response_message))
+        return state
+    
+    
+    def _route_by_intent(self, state: AgentState) -> str:
+        """Routes based on the primary classified intent."""
+        intent = state.get('intent')
+        if intent == 'find_event':
+            return "find_event"
+        if intent == 'book_appointment':
+            return "book"
+        if intent == 'check_availability':
+            return "check"
+        if intent == 'cancel_appointment':
+            return "cancel"
+        if intent == 'reschedule_appointment':
+            return "reschedule"
+        if intent == 'general_inquiry':
+            return "general_inquiry"
+        return "clarify"
+    
+    async def _handle_general_inquiry(self, state: AgentState) -> AgentState:
+        """Handles general inquiries with a more appropriate response."""
+        logger.debug(f"[{state['session_id']}] Node: _handle_general_inquiry")
+        response = "I can help with booking, canceling, and rescheduling appointments. How can I assist you today?"
+        state['messages'].append(AIMessage(content=response))
+        return state
+    
+    
+    def _route_after_event_search(self, state: AgentState) -> str:
+        """Routes after searching for an event to cancel or reschedule."""
+        num_candidates = len(state.get('cancellation_candidates', []))
+        intent = state.get('intent')
+
+        if intent == 'find_event':
+            return "list_events"
+
+        if num_candidates == 0:
+            state['messages'].append(AIMessage(content="I couldn't find any event matching that description. Could you be more specific?"))
+            return "not_found"
+        if num_candidates > 1:
+            return "clarify_cancel"
+
+        if intent == 'cancel_appointment':
+            return "cancel"
+        if intent == 'reschedule_appointment':
+            return "reschedule"
+        return "not_found"
+
+    async def _find_event_for_action(self, state: AgentState) -> AgentState:
+        """Finds calendar events based on the user's message, now with whole-day search."""
+        logger.debug(f"[{state['session_id']}] Node: _find_event_for_action")
+        
+        await self._extract_datetime(state)
+        parsed_time_str = state['extracted_info'].get("parsed_datetime")
+
+        if not parsed_time_str:
+            state['messages'].append(AIMessage("I'm not sure which day you're asking about. Please specify a date."))
+            state['cancellation_candidates'] = []
+            return state
+
+        target_dt = parser.parse(parsed_time_str)
+
+        # [MODIFICATION] Smarter time window selection
+        # If the user's query didn't specify a time, search the whole day
+        if target_dt.hour == 0 and target_dt.minute == 0:
+            start_time = target_dt.isoformat()
+            end_time = (target_dt + timedelta(days=1, microseconds=-1)).isoformat()
+            logger.info(f"Searching for whole day: {target_dt.date()}")
+        else:
+            # If they specified a time, use the original windowed search
+            start_time = (target_dt - timedelta(hours=2)).isoformat()
+            end_time = (target_dt + timedelta(hours=2)).isoformat()
+            logger.info(f"Searching in a window around: {target_dt}")
+
+        events_response = await self.calendar_service.search_events(start_time, end_time)
+        
+        if "error" in events_response:
+            state['messages'].append(AIMessage(f"Sorry, I had trouble searching your calendar: {events_response['error']}"))
+            state['cancellation_candidates'] = []
+        else:
+            state['cancellation_candidates'] = events_response.get('items', [])
+        
+        return state
+
+    async def _list_found_events(self, state: AgentState) -> AgentState:
+        """New node to format and list events found on a specific day."""
+        logger.debug(f"[{state['session_id']}] Node: _list_found_events")
+        events = state.get('cancellation_candidates', [])
+        
+        if not events:
+            response_message = "I looked at that day and couldn't find any scheduled events."
+        else:
+            event_list_str = []
+            for event in events:
+                summary = event.get('summary', 'No Title')
+                start_time_str = event.get('start', {}).get('dateTime')
+                start_time_obj = parser.parse(start_time_str)
+                formatted_time = start_time_obj.strftime('%I:%M %p')
+                event_list_str.append(f"- {formatted_time}: {summary}")
+            
+            response_message = "I found the following events for you:\n" + "\n".join(event_list_str)
+
+        state['messages'].append(AIMessage(content=response_message))
+        return state
+    
+
 
     def _route_after_specific_slot_check(self, state: AgentState) -> str:
         """Routes to confirmation if the slot is free, or suggests alternatives if it's busy."""
@@ -129,23 +410,23 @@ class TailorTalkAgent:
             "intent": result_state['intent']
         }
 
-    # --- Graph Nodes ---
-    # No changes are needed in the node functions themselves.
-
     async def _understand_intent(self, state: AgentState) -> AgentState:
         """Node to understand the user's intent from the latest message."""
         logger.debug(f"[{state['session_id']}] Node: _understand_intent")
         latest_message = state['messages'][-1].content
         prompt = f"""
-        Analyze the user's message to determine their intent for a booking assistant.
+        Analyze the user's message for a booking assistant.
         Message: "{latest_message}"
 
         Classify the intent as one of:
-        - "book_appointment": The user explicitly wants to schedule an appointment. This includes confirming a suggested time.
-        - "check_availability": The user is asking about available times without committing to a booking.
-        - "general_inquiry": The user is asking a question that is not directly about booking or availability.
+        - "find_event": The user is asking about events they have on a certain day (e.g., "What do I have on Friday?", "Any meetings today?").
+        - "book_appointment": User wants to schedule a new appointment (e.g., "Book a meeting", "I need an appointment").
+        - "check_availability": User is asking about available times without committing (e.g., "Are you free tomorrow?", "What times are open?").
+        - "cancel_appointment": User wants to cancel an existing event (e.g., "Cancel my 3pm meeting").
+        - "reschedule_appointment": User wants to move an existing event to a new time (e.g., "Move my meeting to 4pm").
+        - "general_inquiry": For questions that don't fit other categories, or if the intent is unclear.
 
-        Respond with a JSON object: {{"intent": "classified_intent"}}
+        Respond with JSON: {{"intent": "classified_intent"}}
         """
         response = await self.llm.ainvoke([HumanMessage(content=prompt)])
         try:

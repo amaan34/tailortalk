@@ -1,11 +1,12 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import os
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import pytz
 
 from agent import TailorTalkAgent
 from models import ChatMessage
@@ -60,6 +61,9 @@ except Exception as e:
     logger.critical(f"Failed to initialize TailorTalk Agent: {e}", exc_info=True)
     raise
 
+# --- Timezone Configuration ---
+LOCAL_TIMEZONE = pytz.timezone("Asia/Kolkata")
+
 # --- API Endpoints ---
 
 @app.post("/chat", response_model=ChatMessage)
@@ -86,7 +90,7 @@ async def chat(message: ChatMessage):
         logger.error(f"An unexpected error occurred in the chat endpoint: {e}", exc_info=True)
         # Raising HTTPException will forward a clean error to the client
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail="An internal server error occurred. Please try again later."
         )
 
@@ -95,6 +99,39 @@ async def health_check():
     """Provides a simple health check endpoint to verify the service is running."""
     logger.info("Health check endpoint was called.")
     return {"status": "healthy", "service": "TailorTalk API", "timestamp": datetime.now()}
+
+
+@app.get("/events", summary="Get Upcoming Calendar Events")
+async def get_events(
+    start_date: str = Query(None, description="Start date in ISO format"),
+    end_date: str = Query(None, description="End date in ISO format")
+):
+    """
+    Fetches upcoming events from the user's primary calendar.
+    """
+    try:
+        # [FIX] Use timezone-aware datetime objects
+        now_aware = datetime.now(LOCAL_TIMEZONE)
+        if not start_date:
+            start_date = now_aware.isoformat()
+        if not end_date:
+            end_date = (now_aware + timedelta(days=14)).isoformat()
+
+        logger.info(f"Fetching events from {start_date} to {end_date}")
+        events_data = await agent.calendar_service.search_events(start_date, end_date)
+
+        if "error" in events_data:
+            # Log the specific error from the calendar service before raising a generic one
+            logger.error(f"Calendar service error: {events_data['error']}")
+            raise HTTPException(status_code=502, detail=f"Error from Calendar API: {events_data['error']}")
+
+        return events_data.get("items", [])
+    except HTTPException as http_exc:
+        # Re-raise HTTPException to ensure FastAPI handles it correctly
+        raise http_exc
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in /events: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal server error occurred while fetching events.")
 
 
 if __name__ == "__main__":

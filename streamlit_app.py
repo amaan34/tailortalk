@@ -4,6 +4,7 @@ import uuid
 import asyncio
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
+from streamlit_calendar import calendar # Import the new component
 
 # --- Page and Session Configuration ---
 st.set_page_config(
@@ -21,9 +22,10 @@ def initialize_session_state():
         st.session_state.messages = []
     if 'api_base_url' not in st.session_state:
         st.session_state.api_base_url = "http://127.0.0.1:8000"
-    # [MODIFICATION] Key to hold an action triggered by a button
     if 'pending_action' not in st.session_state:
         st.session_state.pending_action = None
+    if 'upcoming_events' not in st.session_state:
+        st.session_state.upcoming_events = []
 
 initialize_session_state()
 
@@ -64,12 +66,36 @@ async def send_message_to_backend(message_content: str) -> None:
                 st.error(f"Error connecting to backend: {e}")
                 st.session_state.messages.append({"content": "Sorry, I'm having trouble connecting to my services.", "sender": "agent"})
 
-# [MODIFICATION] This function now sets a pending action instead of calling the backend directly
 def handle_slot_booking(slot: Dict[str, Any]):
-    """Sets the booking confirmation message as a pending action in session state."""
+    """Sets the booking confirmation message as a pending action."""
     start_time_obj = datetime.fromisoformat(slot['start'].replace('Z', '+00:00'))
-    booking_message = f"I'd like to book the {start_time_obj.strftime('%I:%M %p on %A, %B %d')} slot."
+    booking_message = f"Yes, please book the {start_time_obj.strftime('%I:%M %p on %A, %B %d')} slot."
     st.session_state.pending_action = booking_message
+
+def handle_event_action(action: str, event: Dict[str, Any]):
+    """Sets a cancel or reschedule action as pending."""
+    event_summary = event.get('summary', 'your event')
+    start_time_str = event.get('start', {}).get('dateTime')
+    start_time_obj = datetime.fromisoformat(start_time_str)
+    
+    if action == "cancel":
+        action_message = f"I need to cancel my appointment '{event_summary}' on {start_time_obj.strftime('%A, %B %d at %I:%M %p')}."
+    elif action == "reschedule":
+        action_message = f"I'd like to reschedule my event '{event_summary}' on {start_time_obj.strftime('%A, %B %d at %I:%M %p')}."
+
+    st.session_state.pending_action = action_message
+
+async def fetch_upcoming_events():
+    """Fetches the next 7 days of events from the backend."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{st.session_state.api_base_url}/events")
+            response.raise_for_status()
+            st.session_state.upcoming_events = response.json()
+    except Exception as e:
+        st.sidebar.error(f"Could not fetch events: {e}")
+        st.session_state.upcoming_events = []
+
 
 # --- UI Display Functions ---
 def display_chat_history():
@@ -80,6 +106,56 @@ def display_chat_history():
             st.markdown(msg["content"])
             if msg["sender"] == "agent" and "availability" in msg.get("context", {}):
                 display_availability_buttons(msg["context"]["availability"], message_index=i)
+
+def display_upcoming_events():
+    """Displays upcoming events in the sidebar."""
+    st.sidebar.subheader("🗓️ Upcoming Events")
+    if st.sidebar.button("🔄 Refresh Events"):
+        asyncio.run(fetch_upcoming_events())
+        st.rerun()
+
+    if not st.session_state.upcoming_events:
+        st.sidebar.info("No upcoming events found.")
+        return
+
+    for event in st.session_state.upcoming_events[:7]:
+        summary = event.get('summary', 'No Title')
+        start_time = datetime.fromisoformat(event['start'].get('dateTime')).strftime('%a, %b %d, %I:%M %p')
+        
+        with st.sidebar.expander(f"**{summary}** at {start_time}"):
+            st.button(
+                "❌ Cancel", 
+                key=f"cancel_{event['id']}", 
+                on_click=handle_event_action, 
+                args=("cancel", event)
+            )
+            # Reschedule button can be added here with similar logic
+            st.button(
+                "🔄 Reschedule", 
+                key=f"reschedule_{event['id']}", 
+                on_click=handle_event_action, 
+                args=("reschedule", event)
+            )
+def display_calendar_view():
+    """Renders the visual calendar component."""
+    st.subheader("My Calendar View")
+    calendar_options = {
+        "headerToolbar": {
+            "left": "prev,next today",
+            "center": "title",
+            "right": "dayGridMonth,timeGridWeek,timeGridDay",
+        },
+    }
+    calendar_events = []
+    for event in st.session_state.upcoming_events:
+        calendar_events.append({
+            "title": event.get("summary", "No Title"),
+            "start": event.get("start", {}).get("dateTime"),
+            "end": event.get("end", {}).get("dateTime"),
+        })
+
+    calendar(events=calendar_events, options=calendar_options)
+          
 
 def display_availability_buttons(slots: List[Dict], message_index: int):
     """Renders buttons for available time slots."""
@@ -106,36 +182,48 @@ def display_availability_buttons(slots: List[Dict], message_index: int):
 # --- Main Application Layout ---
 def main():
     st.title("🤖 TailorTalk - Your AI Booking Assistant")
-    st.markdown("_An intelligent conversational agent to schedule your appointments._")
 
     with st.sidebar:
-        st.title("⚙️ Configuration")
+        st.title("⚙️ Configuration & Actions")
         api_url = st.text_input("Backend API URL", value=st.session_state.api_base_url)
         st.session_state.api_base_url = api_url
-        st.subheader("Session Management")
-        st.text(f"Session ID: {st.session_state.session_id[:8]}...")
         if st.button("🔄 Start New Conversation"):
             st.session_state.clear()
             initialize_session_state()
             st.rerun()
+        
+        display_upcoming_events()
 
-    # [MODIFICATION] Handle pending actions at the top of the script run
+    # Main area layout
+    chat_col, calendar_col = st.columns([1, 1])
+
+    with chat_col:
+        st.subheader("💬 Chat")
+        if not st.session_state.messages:
+            st.session_state.messages.append({
+                "content": "👋 Hello! I'm TailorTalk. You can ask me to book, cancel, or reschedule appointments.",
+                "sender": "agent", "timestamp": datetime.now()
+            })
+            # Fetch events on first load
+            asyncio.run(fetch_upcoming_events())
+
+        display_chat_history()
+
+    with calendar_col:
+        display_calendar_view()
+
+    # Handle pending actions at the top of the script run
     if st.session_state.pending_action:
         action = st.session_state.pending_action
-        st.session_state.pending_action = None  # Clear the action
+        st.session_state.pending_action = None # Clear the action
         asyncio.run(send_message_to_backend(action))
-        st.rerun() # Rerun to display the new messages
-
-    if not st.session_state.messages:
-        st.session_state.messages.append({
-            "content": "👋 Hello! I'm TailorTalk. How can I help you schedule today?",
-            "sender": "agent", "timestamp": datetime.now()
-        })
-
-    display_chat_history()
+        # After action, refresh events and rerun
+        asyncio.run(fetch_upcoming_events())
+        st.rerun()
 
     if user_input := st.chat_input("What can I help you with?"):
         asyncio.run(send_message_to_backend(user_input))
+        asyncio.run(fetch_upcoming_events()) # Refresh after user interaction
         st.rerun()
 
 if __name__ == "__main__":
