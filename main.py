@@ -43,7 +43,8 @@ async def chat(message: ChatMessage):
             content=response["message"],
             session_id=message.session_id,
             context=response.get("context", {}),
-            timestamp=datetime.now()
+            timestamp=datetime.now(),
+            sender="agent"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
