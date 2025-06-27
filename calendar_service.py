@@ -1,107 +1,127 @@
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
+from googleapiclient.discovery import build, Resource
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-import json
 import os
+import asyncio
+import logging
+
+# Set up a logger for this service
+logger = logging.getLogger(__name__)
 
 class CalendarService:
-    """Google Calendar integration service"""
+    """
+    A service class to handle all interactions with the Google Calendar API.
+    This class is now fully async and uses asyncio.to_thread for blocking calls.
+    """
     
-    def __init__(self):
-        self.service = None
-        self.credentials = None
-        self.scopes = ['https://www.googleapis.com/auth/calendar']
-        
-        # --- [MODIFICATION] Mock mode is now disabled ---
-        self.mock_mode = False
-        
-        if not self.mock_mode:
-            self._authenticate()
-    
-    def _authenticate(self):
-        """Authenticate with Google Calendar API using a local flow."""
+    def __init__(self, scopes: List[str] = ['https://www.googleapis.com/auth/calendar']):
+        self.service: Optional[Resource] = None
+        self.credentials: Optional[Credentials] = None
+        self.scopes = scopes
+        self.token_file = 'token.json'
+        self.creds_file = 'credentials.json'
+
+    async def _authenticate(self):
+        """
+        Asynchronously authenticates with the Google Calendar API.
+        Handles token loading, refreshing, and new user authorization.
+        """
+        logger.info("Attempting to authenticate with Google Calendar API.")
         creds = None
-        
-        # The file token.json stores the user's access and refresh tokens.
-        if os.path.exists('token.json'):
-            creds = Credentials.from_authorized_user_file('token.json', self.scopes)
-        
-        # If there are no (valid) credentials available, let the user log in.
+        if os.path.exists(self.token_file):
+            try:
+                creds = Credentials.from_authorized_user_file(self.token_file, self.scopes)
+                logger.info("Loaded credentials from token.json.")
+            except Exception as e:
+                logger.error(f"Failed to load credentials from token.json: {e}")
+
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
+                logger.info("Credentials have expired. Refreshing token...")
+                try:
+                    creds.refresh(Request())
+                    logger.info("Token refreshed successfully.")
+                except Exception as e:
+                    logger.error(f"Failed to refresh token: {e}. Re-authentication will be required.")
+                    creds = None # Force re-authentication
             else:
-                # --- [MODIFICATION] Use InstalledAppFlow for desktop apps ---
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    'credentials.json', self.scopes)
-                creds = flow.run_local_server(port=0)
-            # Save the credentials for the next run
-            with open('token.json', 'w') as token:
-                token.write(creds.to_json())
+                logger.info("No valid credentials found. Starting local server for new authorization.")
+                if not os.path.exists(self.creds_file):
+                    logger.critical(f"FATAL: credentials.json not found. Cannot authenticate.")
+                    raise FileNotFoundError(f"Missing required credentials file: {self.creds_file}")
                 
+                flow = InstalledAppFlow.from_client_secrets_file(self.creds_file, self.scopes)
+                # Running the local server in a separate thread to avoid blocking asyncio event loop
+                creds = await asyncio.to_thread(flow.run_local_server, port=0)
+            
+            # Save the new or refreshed credentials
+            with open(self.token_file, 'w') as token:
+                token.write(creds.to_json())
+            logger.info(f"Credentials saved to {self.token_file}.")
+            
         self.credentials = creds
-        self.service = build('calendar', 'v3', credentials=creds)
-    
-    async def get_availability(self, start_time: str, end_time: str) -> List[Dict]:
-        """Get available time slots between start and end time"""
-        if self.mock_mode:
-            return self._get_mock_availability(start_time, end_time)
-        
+        self.service = build('calendar', 'v3', credentials=self.credentials)
+        logger.info("Google Calendar service built successfully.")
+
+    async def _get_service(self) -> Resource:
+        """Ensures the service is authenticated and returns the service object."""
+        if not self.service:
+            await self._authenticate()
+        return self.service
+
+    async def get_availability(self, start_time: str, end_time: str) -> Dict:
+        """
+        Asynchronously gets available time slots between a start and end time.
+        """
+        logger.info(f"Fetching availability from {start_time} to {end_time}.")
         try:
+            service = await self._get_service()
             body = {
                 "timeMin": start_time,
                 "timeMax": end_time,
-                "items": [{"id": "primary"}]
+                "items": [{"id": "primary"}] # Check against the primary calendar
             }
-            # --- [MODIFICATION] Return the raw API response ---
-            freebusy_response = self.service.freebusy().query(body=body).execute()
+            
+            def _blocking_call():
+                return service.freebusy().query(body=body).execute()
+
+            freebusy_response = await asyncio.to_thread(_blocking_call)
+            logger.info("Successfully fetched free/busy information.")
             return freebusy_response
             
         except Exception as e:
-            print(f"Error fetching availability: {e}")
-            return {"error": str(e)}
+            logger.error(f"An error occurred while fetching availability: {e}", exc_info=True)
+            return {"error": f"Failed to communicate with Calendar API: {e}"}
 
-    # --- [MODIFICATION] create_event now returns the full event object ---
-    async def create_event(self, title: str, start_time: str, end_time: str, 
-                           description: str = "", attendees: List[str] = None) -> Dict:
-        """Create a calendar event and return the raw API response."""
-        if self.mock_mode:
-            # This part will not be used, but is kept for completeness
-            return self._create_mock_event(title, start_time, end_time, description, attendees)
-        
+    async def create_event(self, title: str, start_time: str, end_time: str,  
+                             description: str = "", attendees: Optional[List[str]] = None) -> Dict:
+        """
+        Asynchronously creates a calendar event and returns the API response.
+        """
+        logger.info(f"Creating calendar event: '{title}' from {start_time} to {end_time}.")
         try:
-            event = {
+            service = await self._get_service()
+            event_details = {
                 'summary': title,
                 'description': description,
-                'start': {
-                    'dateTime': start_time,
-                    'timeZone': 'UTC',
-                },
-                'end': {
-                    'dateTime': end_time,
-                    'timeZone': 'UTC',
-                },
+                # [MODIFICATION] Remove the explicit 'timeZone' key.
+                # The timezone info is now included in the start_time and end_time ISO strings.
+                'start': {'dateTime': start_time},
+                'end': {'dateTime': end_time},
             }
-            
             if attendees:
-                event['attendees'] = [{'email': email} for email in attendees]
-            
-            # Execute the request and return the entire created event object
-            created_event = self.service.events().insert(calendarId='primary', body=event).execute()
+                event_details['attendees'] = [{'email': email} for email in attendees]
+
+            def _blocking_call():
+                return service.events().insert(calendarId='primary', body=event_details).execute()
+
+            created_event = await asyncio.to_thread(_blocking_call)
+            logger.info(f"Successfully created event with ID: {created_event.get('id')}")
             return created_event
             
         except Exception as e:
-            print(f"Error creating event: {e}")
-            return {"error": str(e)}
-
-    # Mock functions remain for fallback or future use but won't be called now
-    def _get_mock_availability(self, start_time: str, end_time: str) -> List[Dict]:
-        # ...
-        pass
-    def _create_mock_event(self, title: str, start_time: str, end_time: str, 
-                           description: str = "", attendees: List[str] = None) -> Dict:
-        # ...
-        pass
+            logger.error(f"An error occurred while creating the event: {e}", exc_info=True)
+            return {"error": f"Failed to create event in Calendar API: {e}"}

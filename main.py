@@ -1,75 +1,102 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
 import uvicorn
-from datetime import datetime, timedelta
-import json
-from dotenv import load_dotenv
 import os
+import logging
+import time
+from datetime import datetime
+from dotenv import load_dotenv
 
 from agent import TailorTalkAgent
-from models import ChatMessage, BookingRequest, BookingResponse
+from models import ChatMessage
 
-load_dotenv()  # Load environment variables from .env if present
+# --- Logging Configuration ---
+# Configure logging to output to console with a specific format and level
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
+# --- Environment Variable Loading ---
+load_dotenv()
 if not os.getenv("OPENAI_API_KEY"):
-    raise RuntimeError("Missing OPENAI_API_KEY. Please set it in your environment or in a .env file.")
+    logger.critical("FATAL: OPENAI_API_KEY environment variable is not set.")
+    raise RuntimeError("Missing OPENAI_API_KEY. Please set it in your environment or a .env file.")
 
-app = FastAPI(title="TailorTalk API", description="Conversational AI Booking Agent")
+# --- FastAPI App Initialization ---
+app = FastAPI(
+    title="TailorTalk API",
+    description="A conversational AI booking agent backend.",
+    version="1.0.0"
+)
 
-# CORS middleware for Streamlit frontend
+# --- CORS Middleware ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # In production, restrict this to your frontend's domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize the agent
-agent = TailorTalkAgent()
+# --- Request Logging Middleware ---
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Middleware to log incoming requests and their processing time."""
+    start_time = time.time()
+    logger.info(f"Incoming request: {request.method} {request.url.path}")
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    logger.info(f"Response status: {response.status_code} | Process time: {process_time:.4f}s")
+    return response
+
+# --- Agent Initialization ---
+try:
+    agent = TailorTalkAgent()
+    logger.info("TailorTalk Agent initialized successfully.")
+except Exception as e:
+    logger.critical(f"Failed to initialize TailorTalk Agent: {e}", exc_info=True)
+    raise
+
+# --- API Endpoints ---
 
 @app.post("/chat", response_model=ChatMessage)
 async def chat(message: ChatMessage):
-    """Process a chat message and return agent response"""
+    """
+    This is the primary endpoint for interacting with the agent.
+    It processes a chat message and returns the agent's response.
+    """
+    logger.info(f"Received chat message from session: {message.session_id}")
     try:
-        response = await agent.process_message(
-            message.content, 
+        response_data = await agent.process_message(
+            message.content,
             message.session_id,
             message.context
         )
         return ChatMessage(
-            content=response["message"],
+            content=response_data["message"],
             session_id=message.session_id,
-            context=response.get("context", {}),
+            context=response_data.get("context", {}),
             timestamp=datetime.now(),
             sender="agent"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"An unexpected error occurred in the chat endpoint: {e}", exc_info=True)
+        # Raising HTTPException will forward a clean error to the client
+        raise HTTPException(
+            status_code=500, 
+            detail="An internal server error occurred. Please try again later."
+        )
 
-@app.post("/book", response_model=BookingResponse)
-async def book_appointment(booking: BookingRequest):
-    """Book an appointment"""
-    try:
-        result = await agent.book_appointment(booking)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/availability")
-async def get_availability(start_date: str, end_date: str):
-    """Get available time slots"""
-    try:
-        availability = await agent.get_availability(start_date, end_date)
-        return {"availability": availability}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/health")
+@app.get("/health", summary="Health Check")
 async def health_check():
-    return {"status": "healthy", "service": "TailorTalk"}
+    """Provides a simple health check endpoint to verify the service is running."""
+    logger.info("Health check endpoint was called.")
+    return {"status": "healthy", "service": "TailorTalk API", "timestamp": datetime.now()}
+
 
 if __name__ == "__main__":
+    logger.info("Starting TailorTalk FastAPI server.")
     uvicorn.run(app, host="0.0.0.0", port=8000)
