@@ -147,6 +147,27 @@ class TailorTalkAgent:
         logger.debug(f"[{state['session_id']}] Node: _initial_router. Checking for ongoing reschedule.")
         return state
 
+    async def _extract_event_keywords(self, message: str) -> Optional[str]:
+        """Uses the LLM to extract keywords describing an event to find."""
+        logger.debug(f"Extracting event keywords from: '{message}'")
+        prompt = f"""
+        Analyze the user's message and extract the keywords that identify a specific calendar event.
+        For example, from "Reschedule my 2 PM meeting on Monday to 4pm", the keywords are "2 PM meeting".
+        From "Cancel my dental appointment", the keywords are "dental appointment".
+        From "move the project sync call tomorrow", the keywords are "project sync call".
+        Do not extract the new time, only the description of the event to find.
+        Message: "{message}"
+
+        Respond with just the keywords, or with "None" if no specific event keywords are mentioned.
+        """
+        response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+        keywords = response.content.strip()
+        if "None" in keywords or not keywords:
+            logger.info("No specific event keywords found.")
+            return None
+        logger.info(f"Extracted event keywords: {keywords}")
+        return keywords
+    
     async def _handle_reschedule_request(self, state: AgentState) -> AgentState:
         """Handles the FIRST step of a reschedule request: identifying the event and asking for the new time."""
         logger.debug(f"[{state['session_id']}] Node: _handle_reschedule_request")
@@ -167,37 +188,36 @@ class TailorTalkAgent:
         latest_message = state['messages'][-1].content
 
         try:
-            # --- START: LOGIC FIX ---
-            # Step 1: Parse the new time from the user's message using fuzzy parsing.
-            new_time_naive = parser.parse(latest_message, fuzzy=True)
+            # Step 1: Parse the user's latest message to get a naive datetime object.
+            # Using fuzzy_with_tokens=True can give us insight if a date was parsed.
+            new_time_details, parsed_tokens = parser.parse(latest_message, fuzzy_with_tokens=True)
 
-            # Step 2: Get the original date from the event we are rescheduling.
+            # Step 2: Get the original event's start time as a timezone-aware object.
             original_start_dt = parser.parse(original_event['start']['dateTime'])
 
-            # Step 3: Combine the original date with the new time. This is the crucial step
-            # to ensure we stay on the same day unless the user specifies a new one.
-            new_start_time_naive = original_start_dt.replace(
-                hour=new_time_naive.hour,
-                minute=new_time_naive.minute,
-                second=new_time_naive.second,
-                microsecond=0 # Reset microseconds for cleaner time
+            # Step 3: Combine the original date with the new time.
+            new_start_dt = original_start_dt.replace(
+                hour=new_time_details.hour,
+                minute=new_time_details.minute,
+                second=0,
+                microsecond=0
             )
-            
-            # Step 4: Make the combined datetime timezone-aware.
-            new_start_time = LOCAL_TIMEZONE.localize(new_start_time_naive)
-            # --- END: LOGIC FIX ---
-            
-            # Calculate event duration from original event
+
+            # --- This is the key fix ---
+            # We created a new timezone-aware datetime object. We DO NOT need to call .localize() on it again.
+
+            # Step 4: Calculate the event duration from the original event.
             try:
                 original_end_dt = parser.parse(original_event['end']['dateTime'])
                 duration = original_end_dt - original_start_dt
             except (KeyError, TypeError):
                 duration = timedelta(minutes=30)
             
-            new_end_time = new_start_time + duration
+            new_end_dt = new_start_dt + duration
             
+            # Step 5: Check if the new slot is available.
             availability_response = await calendar_service.get_availability(
-                new_start_time.isoformat(), new_end_time.isoformat()
+                new_start_dt.isoformat(), new_end_dt.isoformat()
             )
             busy_times = availability_response.get('calendars', {}).get('primary', {}).get('busy', [])
 
@@ -206,13 +226,13 @@ class TailorTalkAgent:
                 state['messages'].append(AIMessage(content=response_message))
                 return state
 
-            # If free, update the event
+            # Step 6: If free, update the event on the calendar.
             event_id = original_event['id']
             update_body = {
                 'summary': original_event.get('summary'),
                 'description': original_event.get('description'),
-                'start': {'dateTime': new_start_time.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
-                'end': {'dateTime': new_end_time.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
+                'start': {'dateTime': new_start_dt.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
+                'end': {'dateTime': new_end_dt.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
                 'attendees': original_event.get('attendees', [])
             }
             
@@ -221,14 +241,15 @@ class TailorTalkAgent:
             if "error" in update_response:
                 response_message = f"I'm sorry, an error occurred while trying to update the event: {update_response['error']}"
             else:
-                formatted_time = new_start_time.strftime('%I:%M %p on %A, %B %d')
+                formatted_time = new_start_dt.strftime('%I:%M %p on %A, %B %d')
                 response_message = f"Excellent! I have successfully rescheduled your appointment to {formatted_time}."
-                # Clear the state after successful reschedule
+                # Clear the state after a successful reschedule
                 state['event_to_reschedule'] = None
                 state['cancellation_candidates'] = []
 
         except Exception as e:
-            logger.error(f"[{state['session_id']}] Error during reschedule completion: {e}", exc_info=True)
+            # Add more detailed logging to see the exact error in the future.
+            logger.error(f"[{state['session_id']}] Exception in _complete_reschedule: {type(e).__name__}: {e}", exc_info=True)
             response_message = "I'm sorry, I encountered an issue while trying to reschedule that. Could you please specify the full new date and time again?"
 
         state['messages'].append(AIMessage(content=response_message))
@@ -283,7 +304,6 @@ class TailorTalkAgent:
         state['messages'].append(AIMessage(content=response_message))
         return state
 
-
     def _route_by_intent(self, state: AgentState) -> str:
         """Routes based on the primary classified intent."""
         intent = state.get('intent')
@@ -308,7 +328,6 @@ class TailorTalkAgent:
         state['messages'].append(AIMessage(content=response))
         return state
 
-
     def _route_after_event_search(self, state: AgentState) -> str:
         """Routes after searching for an event to cancel or reschedule."""
         num_candidates = len(state.get('cancellation_candidates', []))
@@ -331,39 +350,42 @@ class TailorTalkAgent:
 
     async def _find_event_for_action(self, state: AgentState, config: dict) -> AgentState:
         calendar_service: CalendarService = config["configurable"]["calendar_service"]
-        """Finds calendar events based on the user's message, now with whole-day search."""
-        logger.debug(f"[{state['session_id']}] Node: _find_event_for_action")
-
+        """
+        New robust logic:
+        1. Find ALL events on the specified day.
+        2. If one event, assume it's the correct one.
+        3. If multiple events, the router will ask for clarification.
+        """
+        logger.debug(f"[{state['session_id']}] Node: _find_event_for_action (Robust V2)")
+        
+        # Step 1: Get the target date from the user's message
         await self._extract_datetime(state)
         parsed_time_str = state['extracted_info'].get("parsed_datetime")
 
         if not parsed_time_str:
-            state['messages'].append(AIMessage("I'm not sure which day you're asking about. Please specify a date."))
+            state['messages'].append(AIMessage(content="I'm not sure which day you're asking about. Please specify a date."))
             state['cancellation_candidates'] = []
             return state
 
         target_dt = parser.parse(parsed_time_str)
 
-        # [MODIFICATION] Smarter time window selection
-        # If the user's query didn't specify a time, search the whole day
-        if target_dt.hour == 0 and target_dt.minute == 0:
-            start_time = target_dt.isoformat()
-            end_time = (target_dt + timedelta(days=1, microseconds=-1)).isoformat()
-            logger.info(f"Searching for whole day: {target_dt.date()}")
-        else:
-            # If they specified a time, use the original windowed search
-            start_time = (target_dt - timedelta(hours=2)).isoformat()
-            end_time = (target_dt + timedelta(hours=2)).isoformat()
-            logger.info(f"Searching in a window around: {target_dt}")
+        # Step 2: Set the search window to be the entire day
+        start_time = target_dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        end_time = (target_dt.replace(hour=23, minute=59, second=59, microsecond=0)).isoformat()
+        logger.info(f"Searching for all events on: {target_dt.date()}")
 
-        events_response = await calendar_service.search_events(start_time, end_time)
-
+        # Step 3: Search for ALL events in that window, without any keywords.
+        # The 'query' parameter is deliberately left out.
+        events_response = await calendar_service.search_events(start_time, end_time, query=None)
+        
         if "error" in events_response:
-            state['messages'].append(AIMessage(f"Sorry, I had trouble searching your calendar: {events_response['error']}"))
+            state['messages'].append(AIMessage(content=f"Sorry, I had trouble searching your calendar: {events_response['error']}"))
             state['cancellation_candidates'] = []
         else:
-            state['cancellation_candidates'] = events_response.get('items', [])
-
+            found_events = events_response.get('items', [])
+            state['cancellation_candidates'] = found_events
+            logger.info(f"Found {len(found_events)} candidate events for the day.")
+        
         return state
 
     async def _list_found_events(self, state: AgentState) -> AgentState:
@@ -386,8 +408,6 @@ class TailorTalkAgent:
 
         state['messages'].append(AIMessage(content=response_message))
         return state
-
-
 
     def _route_after_specific_slot_check(self, state: AgentState) -> str:
         """Routes to confirmation if the slot is free, or suggests alternatives if it's busy."""
@@ -423,19 +443,36 @@ class TailorTalkAgent:
         }
 
     async def _understand_intent(self, state: AgentState) -> AgentState:
-        """Node to understand the user's intent from the latest message."""
-        logger.debug(f"[{state['session_id']}] Node: _understand_intent")
+        """
+        Node to understand the user's intent, now with conversation history.
+        """
+        logger.debug(f"[{state['session_id']}] Node: _understand_intent (with history)")
+        
+        # --- FIX: Create a formatted history for the LLM ---
+        history = []
+        for msg in state['messages'][-4:]: # Look at the last 4 messages for context
+            if isinstance(msg, HumanMessage):
+                history.append(f"User: {msg.content}")
+            elif isinstance(msg, AIMessage):
+                history.append(f"Assistant: {msg.content}")
+        
+        conversation_history = "\n".join(history)
         latest_message = state['messages'][-1].content
-        prompt = f"""
-        Analyze the user's message for a booking assistant.
-        Message: "{latest_message}"
 
-        Classify the intent as one of:
-        - "find_event": The user is asking about events they have on a certain day (e.g., "What do I have on Friday?", "Any meetings today?").
-        - "book_appointment": User wants to schedule a new appointment (e.g., "Book a meeting", "I need an appointment").
-        - "check_availability": User is asking about available times without committing (e.g., "Are you free tomorrow?", "What times are open?").
-        - "cancel_appointment": User wants to cancel an existing event (e.g., "Cancel my 3pm meeting").
-        - "reschedule_appointment": User wants to move an existing event to a new time (e.g., "Move my meeting to 4pm").
+        prompt = f"""
+        Analyze the user's latest message in the context of the recent conversation history to determine their primary intent.
+
+        Recent Conversation History:
+        {conversation_history}
+
+        Classify the user's intent for their LATEST message ("User: {latest_message}") as one of:
+        - "provide_reschedule_time": The user is providing a new time in direct response to being asked when to reschedule.
+        - "clarify_event_selection": The user is choosing an event from a list they were just shown.
+        - "find_event": The user is asking about events they have on a certain day.
+        - "book_appointment": User wants to schedule a new appointment.
+        - "check_availability": User is asking about available times without committing.
+        - "cancel_appointment": User wants to cancel an existing event.
+        - "reschedule_appointment": User wants to move an existing event.
         - "general_inquiry": For questions that don't fit other categories, or if the intent is unclear.
 
         Respond with JSON: {{"intent": "classified_intent"}}
@@ -447,6 +484,7 @@ class TailorTalkAgent:
         except (json.JSONDecodeError, KeyError):
             logger.warning("Failed to parse intent from LLM response. Defaulting to 'general_inquiry'.")
             state['intent'] = "general_inquiry"
+            
         logger.info(f"[{state['session_id']}] Detected intent: {state['intent']}")
         return state
 
