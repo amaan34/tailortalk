@@ -5,7 +5,12 @@ import asyncio
 from datetime import datetime
 from dateutil import parser
 from typing import List, Dict, Any
-from streamlit_calendar import calendar  # <-- The import that fixes the NameError
+from streamlit_calendar import calendar
+import os  # --- FIX: Import the os module
+from dotenv import load_dotenv  # --- FIX: Import load_dotenv
+
+# --- FIX: Load environment variables from .env file for local development
+load_dotenv()
 
 # --- Page and Session Configuration ---
 st.set_page_config(
@@ -14,37 +19,39 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- asyncio Event Loop Management ---
+# --- FIX: Updated st.experimental_singleton to st.cache_resource
+@st.cache_resource
+def get_event_loop():
+    """Gets the asyncio event loop for the current session."""
+    return asyncio.new_event_loop()
+
 # --- Session State Initialization ---
 def initialize_session_state():
     """Initializes all necessary keys in Streamlit's session state."""
-    # This block handles the user's login session ID
     if 'user_session_id' not in st.session_state:
         query_params = st.query_params
         if "session_id" in query_params:
             st.session_state.user_session_id = query_params["session_id"]
-            # Important: Clear query params after reading them
             st.query_params.clear()
         else:
             st.session_state.user_session_id = None
-    
-    # This is a separate ID just for the chat conversation history
+
     if 'chat_session_id' not in st.session_state:
         st.session_state.chat_session_id = str(uuid.uuid4())
 
     if 'messages' not in st.session_state:
         st.session_state.messages = []
 
+    # --- FIX: Load API_BASE_URL from environment variables (.env file) ---
     if 'api_base_url' not in st.session_state:
-        try:
-            st.session_state.api_base_url = st.secrets["API_BASE_URL"]
-        except (FileNotFoundError, KeyError):
-            st.session_state.api_base_url = "http://127.0.0.1:8000"
+        # This will now correctly read from your .env file locally
+        st.session_state.api_base_url = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
     if 'upcoming_events' not in st.session_state:
         st.session_state.upcoming_events = []
 
-# --- Backend Communication ---
-
+# --- Backend Communication (No changes needed here) ---
 async def send_message_to_backend(message_content: str):
     """Sends a user's message to the backend and updates the chat history."""
     if not message_content.strip() or not st.session_state.user_session_id:
@@ -52,7 +59,7 @@ async def send_message_to_backend(message_content: str):
 
     st.session_state.messages.append({"content": message_content, "sender": "user"})
     headers = {"X-Session-Id": st.session_state.user_session_id}
-    
+
     with st.chat_message("agent", avatar="🤖"):
         with st.spinner("Thinking..."):
             try:
@@ -81,7 +88,7 @@ async def fetch_upcoming_events():
     if not st.session_state.user_session_id:
         st.session_state.upcoming_events = []
         return
-    
+
     try:
         headers = {"X-Session-Id": st.session_state.user_session_id}
         async with httpx.AsyncClient() as client:
@@ -92,18 +99,20 @@ async def fetch_upcoming_events():
         st.sidebar.error("Could not fetch calendar events.")
         st.session_state.upcoming_events = []
 
-# --- UI Display Functions ---
-
+# --- UI Display Functions (No changes needed here) ---
 def display_chat_history():
+    """Displays the chat history."""
     for msg in st.session_state.messages:
         avatar = "🧑" if msg["sender"] == "user" else "🤖"
         with st.chat_message(name=msg["sender"], avatar=avatar):
             st.markdown(msg["content"])
 
 def display_upcoming_events():
+    """Displays upcoming events in the sidebar."""
     st.sidebar.subheader("🗓️ Upcoming Events")
     if st.sidebar.button("🔄 Refresh Events"):
-        asyncio.run(fetch_upcoming_events())
+        loop = get_event_loop()
+        loop.run_until_complete(fetch_upcoming_events())
         st.rerun()
 
     if not st.session_state.upcoming_events:
@@ -120,6 +129,7 @@ def display_upcoming_events():
             st.sidebar.markdown(f"- **{summary}** (All-day event)")
 
 def display_calendar_view():
+    """Displays the main calendar view."""
     st.subheader("My Calendar View")
     calendar_options = {
         "headerToolbar": {
@@ -135,10 +145,10 @@ def display_calendar_view():
         "end": event.get("end", {}).get("dateTime", event.get("end", {}).get("date")),
         "allDay": "date" in event.get("start", {})
     } for event in st.session_state.upcoming_events]
-    
+
     calendar(events=calendar_events, options=calendar_options)
 
-# --- Main Application Logic ---
+# --- Main Application Logic (No changes needed here) ---
 def main():
     """Defines the main UI and logic of the Streamlit app."""
     initialize_session_state()
@@ -164,7 +174,8 @@ def main():
         st.subheader("💬 Chat")
         if not st.session_state.messages:
             st.session_state.messages.append({"content": "Hello! I'm connected to your calendar. How can I help?", "sender": "agent"})
-            asyncio.run(fetch_upcoming_events())
+            loop = get_event_loop()
+            loop.run_until_complete(fetch_upcoming_events())
             st.rerun()
         display_chat_history()
 
@@ -172,8 +183,9 @@ def main():
         display_calendar_view()
 
     if user_input := st.chat_input("What can I help you with?"):
-        asyncio.run(send_message_to_backend(user_input))
-        asyncio.run(fetch_upcoming_events())
+        loop = get_event_loop()
+        loop.run_until_complete(send_message_to_backend(user_input))
+        loop.run_until_complete(fetch_upcoming_events())
         st.rerun()
 
 if __name__ == "__main__":

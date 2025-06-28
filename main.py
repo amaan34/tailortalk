@@ -61,7 +61,7 @@ def login(request: Request):
     """Initiates the Google OAuth2 login flow."""
     # [FIX] Construct the redirect URI manually for robustness
     redirect_uri = f"{request.base_url}callback"
-    
+
     flow = Flow.from_client_config(
         client_config=CLIENT_CONFIG,
         scopes=SCOPES,
@@ -92,7 +92,7 @@ async def callback(request: Request, db: Session = Depends(get_db)):
         state=state,
         redirect_uri=redirect_uri
     )
-    
+
     try:
         flow.fetch_token(authorization_response=str(request.url))
     except Exception as e:
@@ -113,11 +113,11 @@ async def callback(request: Request, db: Session = Depends(get_db)):
     db.commit()
 
     # [FIX] Use the environment variable for the Streamlit app URL
-    streamlit_url = os.getenv("STREAMLIT_APP_URL")
+    streamlit_url = os.getenv("STREAMLIT_APP_URL", "http://localhost:8501")
     if not streamlit_url:
         logger.error("STREAMLIT_APP_URL environment variable not set!")
         raise HTTPException(status_code=500, detail="Application is not configured correctly.")
-        
+
     final_redirect_url = f"{streamlit_url}?session_id={session_id}"
     logger.info(f"Successfully authenticated user. Redirecting to: {final_redirect_url}")
     return RedirectResponse(final_redirect_url)
@@ -143,7 +143,7 @@ async def chat(message: ChatMessage, calendar_service: CalendarService = Depends
         calendar_service=calendar_service
     )
     return ChatMessage(
-        content=response_data["message"], session_id=message.session_id,
+        content=response_data["content"], session_id=message.session_id,
         context=response_data.get("context", {}), sender="agent"
     )
 
@@ -156,7 +156,7 @@ async def get_events(
     now_aware = datetime.now(LOCAL_TIMEZONE)
     effective_start_date = start_date or now_aware.isoformat()
     effective_end_date = end_date or (now_aware + timedelta(days=14)).isoformat()
-    
+
     logger.info(f"Fetching events from {effective_start_date} to {effective_end_date}")
     events_data = await calendar_service.search_events(effective_start_date, effective_end_date)
     if "error" in events_data:

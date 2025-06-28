@@ -26,11 +26,12 @@ class AgentState(TypedDict):
     extracted_info: Dict[str, Any]
     availability_checked: bool
     booking_confirmed: bool
-    final_booking_details: BookingRequest
+    final_booking_details: Optional[BookingRequest]
     conversation_stage: str
     cancellation_candidates: List[Dict]
     event_to_reschedule: Optional[Dict]
     suggested_slots: List[Dict]
+
 class TailorTalkAgent:
     """The core conversational agent for booking appointments."""
 
@@ -149,14 +150,14 @@ class TailorTalkAgent:
     async def _handle_reschedule_request(self, state: AgentState) -> AgentState:
         """Handles the FIRST step of a reschedule request: identifying the event and asking for the new time."""
         logger.debug(f"[{state['session_id']}] Node: _handle_reschedule_request")
-        
+
         event_to_reschedule = state['cancellation_candidates'][0]
         state['event_to_reschedule'] = event_to_reschedule
-        
+
         response_message = f"I can help with that. I've found the event '{event_to_reschedule.get('summary')}'. When were you thinking of rescheduling the appointment?"
         state['messages'].append(AIMessage(content=response_message))
         return state
-        
+
     async def _complete_reschedule(self, state: AgentState, config: dict) -> AgentState:
         calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """Handles the SECOND step of rescheduling: processing the user's new desired time."""
@@ -164,55 +165,71 @@ class TailorTalkAgent:
         
         original_event = state['event_to_reschedule']
         latest_message = state['messages'][-1].content
-        
-        await self._extract_datetime(state)
-        new_time_str = state['extracted_info'].get("parsed_datetime")
 
-        if not new_time_str:
-            response_message = "I'm sorry, I didn't understand that time. Could you please provide the new date and time for the reschedule?"
-            state['messages'].append(AIMessage(content=response_message))
-            return state
-
-        new_start_time = parser.parse(new_time_str)
-        
-        # Calculate event duration from original event, default to 30 mins if not available
         try:
-            original_start = parser.parse(original_event['start']['dateTime'])
-            original_end = parser.parse(original_event['end']['dateTime'])
-            duration = original_end - original_start
-        except (KeyError, TypeError):
-            duration = timedelta(minutes=30)
-        
-        new_end_time = new_start_time + duration
-        
-        availability_response = await self.calendar_service.get_availability(
-            new_start_time.isoformat(), new_end_time.isoformat()
-        )
-        busy_times = availability_response.get('calendars', {}).get('primary', {}).get('busy', [])
+            # --- START: LOGIC FIX ---
+            # Step 1: Parse the new time from the user's message using fuzzy parsing.
+            new_time_naive = parser.parse(latest_message, fuzzy=True)
 
-        if busy_times:
-            response_message = f"I'm sorry, but that time is already booked. Please suggest another time for rescheduling '{original_event.get('summary')}'."
-            state['messages'].append(AIMessage(content=response_message))
-            return state
+            # Step 2: Get the original date from the event we are rescheduling.
+            original_start_dt = parser.parse(original_event['start']['dateTime'])
 
-        event_id = original_event['id']
-        update_body = {
-            'summary': original_event.get('summary'),
-            'description': original_event.get('description'),
-            'start': {'dateTime': new_start_time.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
-            'end': {'dateTime': new_end_time.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
-            'attendees': original_event.get('attendees', [])
-        }
-        
-        update_response = await self.calendar_service.update_event(event_id, update_body)
+            # Step 3: Combine the original date with the new time. This is the crucial step
+            # to ensure we stay on the same day unless the user specifies a new one.
+            new_start_time_naive = original_start_dt.replace(
+                hour=new_time_naive.hour,
+                minute=new_time_naive.minute,
+                second=new_time_naive.second,
+                microsecond=0 # Reset microseconds for cleaner time
+            )
+            
+            # Step 4: Make the combined datetime timezone-aware.
+            new_start_time = LOCAL_TIMEZONE.localize(new_start_time_naive)
+            # --- END: LOGIC FIX ---
+            
+            # Calculate event duration from original event
+            try:
+                original_end_dt = parser.parse(original_event['end']['dateTime'])
+                duration = original_end_dt - original_start_dt
+            except (KeyError, TypeError):
+                duration = timedelta(minutes=30)
+            
+            new_end_time = new_start_time + duration
+            
+            availability_response = await calendar_service.get_availability(
+                new_start_time.isoformat(), new_end_time.isoformat()
+            )
+            busy_times = availability_response.get('calendars', {}).get('primary', {}).get('busy', [])
 
-        if "error" in update_response:
-            response_message = f"I'm sorry, an error occurred while trying to update the event: {update_response['error']}"
-        else:
-            formatted_time = new_start_time.strftime('%I:%M %p on %A, %B %d')
-            response_message = f"Excellent! I have successfully rescheduled your appointment to {formatted_time}."
-            state['event_to_reschedule'] = None
-            state['cancellation_candidates'] = []
+            if busy_times:
+                response_message = f"I'm sorry, but that time is already booked. Please suggest another time for rescheduling '{original_event.get('summary')}'."
+                state['messages'].append(AIMessage(content=response_message))
+                return state
+
+            # If free, update the event
+            event_id = original_event['id']
+            update_body = {
+                'summary': original_event.get('summary'),
+                'description': original_event.get('description'),
+                'start': {'dateTime': new_start_time.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
+                'end': {'dateTime': new_end_time.isoformat(), 'timeZone': str(LOCAL_TIMEZONE)},
+                'attendees': original_event.get('attendees', [])
+            }
+            
+            update_response = await calendar_service.update_event(event_id, update_body)
+
+            if "error" in update_response:
+                response_message = f"I'm sorry, an error occurred while trying to update the event: {update_response['error']}"
+            else:
+                formatted_time = new_start_time.strftime('%I:%M %p on %A, %B %d')
+                response_message = f"Excellent! I have successfully rescheduled your appointment to {formatted_time}."
+                # Clear the state after successful reschedule
+                state['event_to_reschedule'] = None
+                state['cancellation_candidates'] = []
+
+        except Exception as e:
+            logger.error(f"[{state['session_id']}] Error during reschedule completion: {e}", exc_info=True)
+            response_message = "I'm sorry, I encountered an issue while trying to reschedule that. Could you please specify the full new date and time again?"
 
         state['messages'].append(AIMessage(content=response_message))
         return state
@@ -225,16 +242,16 @@ class TailorTalkAgent:
         # 2. Extract the NEW desired time from the user's message.
         # 3. Check availability for the new time.
         # 4. If free, call update_event. If not, suggest alternatives.
-        
+
         event_to_reschedule = state['cancellation_candidates'][0]
         state['event_to_reschedule'] = event_to_reschedule
-        
+
         # For now, we just ask for the new time.
         response_message = f"Okay, I'm ready to reschedule '{event_to_reschedule.get('summary')}'. What's the new time you'd like?"
         state['messages'].append(AIMessage(content=response_message))
         # The next turn of conversation would be handled by the graph again.
         return state
-    
+
     async def _clarify_cancellation(self, state: AgentState) -> AgentState:
         """Asks the user to clarify which event to cancel from a list."""
         logger.debug(f"[{state['session_id']}] Node: _clarify_cancellation")
@@ -243,7 +260,7 @@ class TailorTalkAgent:
         for event in candidates:
             start_time = parser.parse(event['start'].get('dateTime')).strftime('%I:%M %p')
             options.append(f"'{event['summary']}' at {start_time}")
-        
+
         message = "I found a few events that match. Which one did you mean?\n- " + "\n- ".join(options)
         state['messages'].append(AIMessage(content=message))
         return state
@@ -256,17 +273,17 @@ class TailorTalkAgent:
         event_id = event_to_cancel.get('id')
         summary = event_to_cancel.get('summary', 'your appointment')
 
-        result = await self.calendar_service.delete_event(event_id)
+        result = await calendar_service.delete_event(event_id)
 
         if "error" in result:
             response_message = f"I'm sorry, I failed to cancel '{summary}'. Error: {result['error']}"
         else:
             response_message = f"Done. I have successfully cancelled your event: '{summary}'."
-        
+
         state['messages'].append(AIMessage(content=response_message))
         return state
-    
-    
+
+
     def _route_by_intent(self, state: AgentState) -> str:
         """Routes based on the primary classified intent."""
         intent = state.get('intent')
@@ -283,15 +300,15 @@ class TailorTalkAgent:
         if intent == 'general_inquiry':
             return "general_inquiry"
         return "clarify"
-    
+
     async def _handle_general_inquiry(self, state: AgentState) -> AgentState:
         """Handles general inquiries with a more appropriate response."""
         logger.debug(f"[{state['session_id']}] Node: _handle_general_inquiry")
         response = "I can help with booking, canceling, and rescheduling appointments. How can I assist you today?"
         state['messages'].append(AIMessage(content=response))
         return state
-    
-    
+
+
     def _route_after_event_search(self, state: AgentState) -> str:
         """Routes after searching for an event to cancel or reschedule."""
         num_candidates = len(state.get('cancellation_candidates', []))
@@ -316,7 +333,7 @@ class TailorTalkAgent:
         calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """Finds calendar events based on the user's message, now with whole-day search."""
         logger.debug(f"[{state['session_id']}] Node: _find_event_for_action")
-        
+
         await self._extract_datetime(state)
         parsed_time_str = state['extracted_info'].get("parsed_datetime")
 
@@ -339,21 +356,21 @@ class TailorTalkAgent:
             end_time = (target_dt + timedelta(hours=2)).isoformat()
             logger.info(f"Searching in a window around: {target_dt}")
 
-        events_response = await self.calendar_service.search_events(start_time, end_time)
-        
+        events_response = await calendar_service.search_events(start_time, end_time)
+
         if "error" in events_response:
             state['messages'].append(AIMessage(f"Sorry, I had trouble searching your calendar: {events_response['error']}"))
             state['cancellation_candidates'] = []
         else:
             state['cancellation_candidates'] = events_response.get('items', [])
-        
+
         return state
 
     async def _list_found_events(self, state: AgentState) -> AgentState:
         """New node to format and list events found on a specific day."""
         logger.debug(f"[{state['session_id']}] Node: _list_found_events")
         events = state.get('cancellation_candidates', [])
-        
+
         if not events:
             response_message = "I looked at that day and couldn't find any scheduled events."
         else:
@@ -364,12 +381,12 @@ class TailorTalkAgent:
                 start_time_obj = parser.parse(start_time_str)
                 formatted_time = start_time_obj.strftime('%I:%M %p')
                 event_list_str.append(f"- {formatted_time}: {summary}")
-            
+
             response_message = "I found the following events for you:\n" + "\n".join(event_list_str)
 
         state['messages'].append(AIMessage(content=response_message))
         return state
-    
+
 
 
     def _route_after_specific_slot_check(self, state: AgentState) -> str:
@@ -383,13 +400,13 @@ class TailorTalkAgent:
             # We set a flag to give a better response message in the next step
             state['context']['user_informed_slot_is_busy'] = True
             return "suggest_alternatives"
-        
+
     async def process_message(self, message: str, session_id: str, context: Dict, calendar_service: CalendarService) -> Dict[str, Any]:
         logger.info(f"Processing message for session_id: {session_id}")
         if session_id not in self.sessions:
             self.sessions[session_id] = self.initial_state.copy()
             self.sessions[session_id]['session_id'] = session_id
-        
+
         state = self.sessions[session_id]
         state['messages'].append(HumanMessage(content=message))
         if context:
@@ -397,11 +414,11 @@ class TailorTalkAgent:
 
         graph_config = {"configurable": {"calendar_service": calendar_service}}
         result_state = await self.graph.ainvoke(state, config=graph_config)
-        
+
         self.sessions[session_id] = result_state
         logger.info(f"Finished processing. Final intent: '{result_state['intent']}'")
         return {
-            "message": result_state['messages'][-1].content if result_state['messages'] else "How can I help you?",
+            "content": result_state['messages'][-1].content if result_state['messages'] else "How can I help you?",
             "context": result_state['context'], "intent": result_state['intent']
         }
 
@@ -438,18 +455,18 @@ class TailorTalkAgent:
         logger.debug(f"[{state['session_id']}] Node: _extract_datetime")
         human_messages = [msg.content for msg in state['messages'] if isinstance(msg, HumanMessage)]
         latest_human_message = human_messages[-1] if human_messages else ""
-        
+
         try:
             if latest_human_message:
                 # Step 1: Parse the naive datetime from user input
                 parsed_time_naive = parser.parse(latest_human_message, fuzzy=True)
                 # Step 2: [MODIFICATION] Make the datetime object "aware" of the local timezone
                 parsed_time_aware = LOCAL_TIMEZONE.localize(parsed_time_naive)
-                
+
                 state['extracted_info']["parsed_datetime"] = parsed_time_aware.isoformat()
                 logger.info(f"[{state['session_id']}] Extracted and localized datetime: {parsed_time_aware.isoformat()} from message: '{latest_human_message}'")
             else:
-                 raise ValueError("No human message to parse.")
+                raise ValueError("No human message to parse.")
         except (ValueError, TypeError):
             logger.info(f"[{state['session_id']}] No specific datetime found in the last human message.")
             state['extracted_info'].pop("parsed_datetime", None)
@@ -461,7 +478,7 @@ class TailorTalkAgent:
         calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """Node to check the calendar for available slots."""
         logger.debug(f"[{state['session_id']}] Node: _check_availability")
-        
+
         # [MODIFICATION] Work with timezone-aware datetimes
         if "parsed_datetime" in state['extracted_info']:
             target_date = parser.parse(state['extracted_info']["parsed_datetime"])
@@ -474,7 +491,7 @@ class TailorTalkAgent:
 
         try:
             # The service expects ISO format strings, which our aware objects now provide
-            availability_response = await self.calendar_service.get_availability(
+            availability_response = await calendar_service.get_availability(
                 start_of_day.isoformat(),
                 end_of_day.isoformat()
             )
@@ -494,23 +511,24 @@ class TailorTalkAgent:
 
         if not has_datetime:
             return "clarify"
-        
+
         # If user wants to book a specific time, check that slot first.
         if intent == 'book_appointment':
             logger.info(f"[{state['session_id']}] Routing to check specific slot.")
             return "check_specific_slot"
-        
+
         # If user just wants to see general availability for a day.
         if intent == 'check_availability':
             logger.info(f"[{state['session_id']}] Routing to check general day availability.")
             return "check_availability"
-            
+
         return "clarify"
 
-    async def _check_availability(self, state: AgentState) -> AgentState:
+    async def _check_availability(self, state: AgentState, config: dict) -> AgentState:
+        calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """Node to check the calendar for available slots."""
         logger.debug(f"[{state['session_id']}] Node: _check_availability")
-        
+
         if "parsed_datetime" in state['extracted_info']:
             target_date = parser.parse(state['extracted_info']["parsed_datetime"])
         else:
@@ -522,7 +540,7 @@ class TailorTalkAgent:
         try:
             # [FIX] Removed the incorrect `+ "Z"` concatenation.
             # .isoformat() on an aware object already produces the correct RFC3339 string.
-            availability_response = await self.calendar_service.get_availability(
+            availability_response = await calendar_service.get_availability(
                 start_of_day.isoformat(),
                 end_of_day.isoformat()
             )
@@ -537,11 +555,11 @@ class TailorTalkAgent:
             logger.error(f"[{state['session_id']}] Error during availability check: {e}", exc_info=True)
             state['context']["availability_error"] = str(e)
         return state
-    
+
     async def _suggest_times(self, state: AgentState) -> AgentState:
         """Suggests available time slots, now with context-aware messages."""
         logger.debug(f"[{state['session_id']}] Node: _suggest_times")
-        
+
         # This part of the node is largely the same as the last version, but we add a custom message.
         if "availability_error" in state['context']:
             # ... (error handling remains the same)
@@ -606,7 +624,7 @@ class TailorTalkAgent:
             start_time = parser.parse(booking_time_str)
             end_time = start_time + timedelta(minutes=30)
             logger.info(f"[{state['session_id']}] Attempting to book event for {start_time.isoformat()}")
-            booking_response = await self.calendar_service.create_event(title="TailorTalk Appointment", start_time=start_time.isoformat(), end_time=end_time.isoformat(), description="This appointment was booked by the TailorTalk AI Assistant.")
+            booking_response = await calendar_service.create_event(title="TailorTalk Appointment", start_time=start_time.isoformat(), end_time=end_time.isoformat(), description="This appointment was booked by the TailorTalk AI Assistant.")
             if booking_response and 'id' in booking_response:
                 response_message = f"Excellent! I have successfully booked your appointment for {start_time.strftime('%I:%M %p on %A, %B %d')}. You will receive a calendar invitation shortly."
                 state['booking_confirmed'] = True
@@ -621,9 +639,9 @@ class TailorTalkAgent:
             logger.error(f"[{state['session_id']}] An unexpected exception in _confirm_booking.", exc_info=True)
         state['messages'].append(AIMessage(content=response_message))
         return state
-    
-        # --- Graph Nodes ---
-    
+
+    # --- Graph Nodes ---
+
     async def _check_specific_slot(self, state: AgentState, config: dict) -> AgentState:
         calendar_service: CalendarService = config["configurable"]["calendar_service"]
         """New node to check availability for only the exact time the user requested."""
@@ -631,21 +649,21 @@ class TailorTalkAgent:
         try:
             start_time = parser.parse(state['extracted_info']["parsed_datetime"])
             end_time = start_time + timedelta(minutes=30)
-            
-            availability_response = await self.calendar_service.get_availability(
+
+            availability_response = await calendar_service.get_availability(
                 start_time.isoformat(), end_time.isoformat()
             )
-            
+
             if "error" in availability_response:
                 raise Exception(availability_response["error"])
 
             busy_times = availability_response.get('calendars', {}).get('primary', {}).get('busy', [])
-            
+
             # If the busy list is empty for this narrow window, the slot is free
             state['context']['is_slot_available'] = not busy_times
-            
+
         except Exception as e:
             logger.error(f"[{state['session_id']}] Error during specific slot check: {e}", exc_info=True)
             state['context']['is_slot_available'] = False # Assume not available on error
-            
+
         return state
